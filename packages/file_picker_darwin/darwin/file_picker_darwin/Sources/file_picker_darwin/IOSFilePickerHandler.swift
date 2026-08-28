@@ -2,6 +2,7 @@
 import AVFoundation
 import Flutter
 import Foundation
+import Photos
 import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
@@ -153,19 +154,34 @@ final class IOSFilePickerHandler: NSObject,
 
         for (index, item) in results.enumerated() {
             group.enter()
-            item.itemProvider.loadFileRepresentation(
-                forTypeIdentifier: UTType.item.identifier
-            ) { [weak self] url, _ in
-                defer { group.leave() }
-                guard let self, let sourceURL = url,
-                      let copiedURL = self.copyToTemporaryDirectory(sourceURL)
-                else {
-                    return
-                }
-                if let fileInfo = self.makeFileInfo(from: copiedURL) {
+            let complete: ([String: Any]?) -> Void = { fileInfo in
+                if let fileInfo {
                     resolvedLock.lock()
                     resolved[index] = fileInfo
                     resolvedLock.unlock()
+                }
+                group.leave()
+            }
+
+            loadOriginalVideoResource(for: item) { [weak self] originalURL in
+                guard let self else {
+                    complete(nil)
+                    return
+                }
+                if let originalURL {
+                    complete(self.makeFileInfo(from: originalURL))
+                    return
+                }
+                item.itemProvider.loadFileRepresentation(
+                    forTypeIdentifier: UTType.item.identifier
+                ) { [weak self] url, _ in
+                    guard let self, let sourceURL = url,
+                          let copiedURL = self.copyToTemporaryDirectory(sourceURL)
+                    else {
+                        complete(nil)
+                        return
+                    }
+                    complete(self.makeFileInfo(from: copiedURL))
                 }
             }
         }
@@ -366,6 +382,104 @@ final class IOSFilePickerHandler: NSObject,
         }
 
         return topController
+    }
+
+    /// Fetches a picked video's file via `PHAssetResource` instead of the
+    /// item provider, writing it once into the temporary directory, and calls
+    /// `completion` with the written file's URL — or `nil` whenever this path
+    /// does not apply, in which case the caller falls back to
+    /// `loadFileRepresentation`.
+    ///
+    /// This exists because `loadFileRepresentation` ignores
+    /// `PHPickerConfiguration.preferredAssetRepresentationMode.current` for
+    /// slow-motion videos: it always re-renders the slow-motion composition
+    /// into a 30 fps H.264 file, at roughly real-time speed
+    /// (https://developer.apple.com/forums/thread/693127). Reading the asset's
+    /// resource returns the actual high-frame-rate file. It only engages in
+    /// `.current` mode, and needs photo-library read access plus an asset
+    /// identifier — the picker only provides identifiers when initialized
+    /// with a `PHPhotoLibrary`.
+    private func loadOriginalVideoResource(
+        for item: PHPickerResult,
+        completion: @escaping (URL?) -> Void
+    ) {
+        guard assetRepresentationMode == .current else {
+            print("file_picker_darwin: resource path skipped — mode is not .current")
+            completion(nil)
+            return
+        }
+        guard let assetIdentifier = item.assetIdentifier else {
+            print("file_picker_darwin: resource path skipped — no assetIdentifier")
+            completion(nil)
+            return
+        }
+
+        let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard authStatus == .authorized || authStatus == .limited else {
+            print("file_picker_darwin: resource path skipped — photo auth status \(authStatus.rawValue)")
+            completion(nil)
+            return
+        }
+
+        guard let asset = PHAsset.fetchAssets(
+            withLocalIdentifiers: [assetIdentifier], options: nil
+        ).firstObject, asset.mediaType == .video else {
+            print("file_picker_darwin: resource path skipped — asset missing or not a video")
+            completion(nil)
+            return
+        }
+
+        let resources = PHAssetResource.assetResources(for: asset)
+        print("file_picker_darwin: asset resources: \(resources.map { "\($0.type.rawValue):\($0.originalFilename)" }.joined(separator: ", "))")
+        // Slow-motion is stored as an adjustment, so a slow-mo capture has a
+        // .fullSizeVideo resource — the rendered 30 fps H.264 bake this whole
+        // path exists to avoid, and Photos may spend minutes generating it.
+        // For high-frame-rate assets always take the original .video resource;
+        // for anything else prefer the edited render when one exists so
+        // `.current` keeps meaning "what the library currently shows".
+        let isHighFrameRate = asset.mediaSubtypes.contains(.videoHighFrameRate)
+        guard let resource = isHighFrameRate
+            ? resources.first(where: { $0.type == .video })
+            : resources.first(where: { $0.type == .fullSizeVideo })
+                ?? resources.first(where: { $0.type == .video })
+        else {
+            completion(nil)
+            return
+        }
+
+        let destinationURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(resource.originalFilename)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        // Only fires when the resource has to come down from iCloud — a large
+        // original that was never local can take minutes and would otherwise
+        // look like a hang.
+        var lastLoggedProgress = -1
+        options.progressHandler = { progress in
+            let percent = Int(progress * 10) * 10
+            if percent != lastLoggedProgress {
+                lastLoggedProgress = percent
+                print("file_picker_darwin: iCloud download \(percent)% for \(resource.originalFilename)")
+            }
+        }
+
+        print("file_picker_darwin: writing \(resource.type == .video ? "original" : "edited") resource '\(resource.originalFilename)' (HFR=\(isHighFrameRate))")
+        let started = Date()
+        PHAssetResourceManager.default().writeData(
+            for: resource, toFile: destinationURL, options: options
+        ) { error in
+            let elapsed = Int(-started.timeIntervalSinceNow)
+            if let error {
+                print("file_picker_darwin: resource write FAILED after \(elapsed)s: \(error.localizedDescription) — falling back to item provider")
+            } else {
+                print("file_picker_darwin: resource written in \(elapsed)s")
+            }
+            completion(error == nil ? destinationURL : nil)
+        }
     }
 
     private func copyToTemporaryDirectory(_ sourceURL: URL) -> URL? {
